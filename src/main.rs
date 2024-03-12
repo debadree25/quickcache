@@ -20,29 +20,65 @@ macro_rules! syscall {
 
 struct RequestContext {
     stream: TcpStream,
+    write_buffer: Vec<u8>,
 }
 
 impl RequestContext {
     fn new(stream: TcpStream) -> RequestContext {
-        RequestContext { stream }
+        RequestContext {
+            stream,
+            write_buffer: Vec::with_capacity(1024),
+        }
     }
 
     fn handle_read(&mut self) -> Result<Option<String>, Box<dyn std::error::Error>> {
         let mut buffer = [0; 1024];
-        let nread = self.stream.read(&mut buffer)?;
-        if nread == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(std::str::from_utf8(&buffer)?.to_string()))
+        let mut total_data = String::new();
+        loop {
+            match self.stream.read(&mut buffer) {
+                Ok(0) => {
+                    // client discoonnected
+                    return Ok(None);
+                }
+                Ok(n) => {
+                    total_data.push_str(std::str::from_utf8(&buffer[..n])?);
+                    if n < buffer.len() {
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    break;
+                }
+                Err(e) => return Err(Box::new(e)),
+            }
         }
+        Ok(Some(total_data))
     }
 
-    fn handle_write(&mut self, response: &str) -> std::io::Result<()> {
-        self.stream.write_all(response.as_bytes())?;
+    fn dispatch_write(&mut self, response: &str) {
+        self.write_buffer.extend_from_slice(response.as_bytes());
+    }
+
+    fn write_to_socket(&mut self) -> std::io::Result<()> {
+        while !self.write_buffer.is_empty() {
+            match self.stream.write(&self.write_buffer) {
+                Ok(0) => {
+                    break;
+                }
+                Ok(n) => {
+                    self.write_buffer.drain(0..n);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
         Ok(())
     }
 }
 
+// TODO: unify these kqueue methods
 fn kqueue() -> std::io::Result<RawFd> {
     let fd = syscall!(kqueue())?;
     if let Ok(flags) = syscall!(fcntl(fd, libc::F_GETFD)) {
@@ -71,6 +107,66 @@ fn register_with_kqueue_for_read(kq: i32, fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
+fn register_with_kqueue_for_write(kq: i32, fd: i32) -> std::io::Result<()> {
+    let mut event = libc::kevent {
+        ident: fd as usize,
+        filter: libc::EVFILT_WRITE,
+        flags: libc::EV_ADD,
+        fflags: 0,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    syscall!(kevent(
+        kq,
+        &mut event,
+        1,
+        std::ptr::null_mut(),
+        0,
+        std::ptr::null()
+    ))?;
+    Ok(())
+}
+
+fn unregister_with_kqueue_for_read(kq: i32, fd: i32) -> std::io::Result<()> {
+    let mut event = libc::kevent {
+        ident: fd as usize,
+        filter: libc::EVFILT_READ,
+        flags: libc::EV_DELETE,
+        fflags: 0,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    syscall!(kevent(
+        kq,
+        &mut event,
+        1,
+        std::ptr::null_mut(),
+        0,
+        std::ptr::null()
+    ))?;
+    Ok(())
+}
+
+fn unregister_with_kqueue_for_write(kq: i32, fd: i32) -> std::io::Result<()> {
+    let mut event = libc::kevent {
+        ident: fd as usize,
+        filter: libc::EVFILT_WRITE,
+        flags: libc::EV_DELETE,
+        fflags: 0,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    syscall!(kevent(
+        kq,
+        &mut event,
+        1,
+        std::ptr::null_mut(),
+        0,
+        std::ptr::null()
+    ))?;
+    Ok(())
+}
+
 fn get_kqueue_events(kq: i32) -> std::io::Result<Vec<libc::kevent>> {
     let mut events: Vec<libc::kevent> = vec![
         libc::kevent {
@@ -81,7 +177,7 @@ fn get_kqueue_events(kq: i32) -> std::io::Result<Vec<libc::kevent>> {
             data: 0,
             udata: std::ptr::null_mut(),
         };
-        10
+        256
     ];
     let n = syscall!(kevent(
         kq,
@@ -105,7 +201,7 @@ fn main() {
     let mut streams_map = HashMap::new();
     register_with_kqueue_for_read(kq, listener_fd)
         .expect("Failed to register listener with kqueue");
-    let pool = ThreadPool::new(4);
+    let pool = ThreadPool::new(4); // TODO: make use of this
     loop {
         println!("Waiting for events");
         println!("Requests in flight {}", streams_map.len());
@@ -132,27 +228,41 @@ fn main() {
             } else {
                 let fd = event.ident as i32;
                 match streams_map.get_mut(&fd) {
-                    Some(request_context) => {
-                        if event.filter == libc::EVFILT_READ {
-                            match request_context.handle_read() {
-                                Ok(Some(request)) => {
-                                    println!("Got request: {}", request);
-                                    request_context
-                                        .handle_write("+PONG\r\n")
-                                        .unwrap_or_else(|e| {
-                                            eprintln!("Failed to write response: {}", e)
-                                        })
-                                }
-                                Ok(None) => {
-                                    println!("Client disconnected");
-                                    streams_map.remove(&fd);
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to read from stream: {}", e);
-                                }
+                    Some(request_context) => match event.filter {
+                        libc::EVFILT_READ => match request_context.handle_read() {
+                            Ok(Some(request)) => {
+                                request_context.dispatch_write("+PONG\r\n");
+                                register_with_kqueue_for_write(kq, fd).expect("Failed to register stream with kqueue");
                             }
+                            Ok(None) => {
+                                println!("Client disconnected");
+                                streams_map.remove(&fd);
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to read from stream: {}", e);
+                            }
+                        },
+                        libc::EVFILT_WRITE => match request_context.write_to_socket() {
+                            Ok(()) => {
+                                println!("Response sent");
+                                unregister_with_kqueue_for_write(kq, fd).unwrap_or_else(|e| {
+                                    eprintln!("Failed to unregister write event for file descriptor: {}", e)
+                                });
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                eprintln!("Write would block, which should not happen!!");
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to write to stream: {}", e);
+                            }
+                        },
+                        _ => {
+                            eprintln!(
+                                "Got unexpected event for file descriptor: {} {}",
+                                fd, event.filter
+                            );
                         }
-                    }
+                    },
                     None => {
                         eprintln!("Got event for unknown file descriptor: {}", fd);
                     }
