@@ -1,12 +1,12 @@
-pub mod threadpool;
 pub mod resp;
+pub mod storage;
 
+use resp::{RedisCommand, RedisValue};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
-use threadpool::ThreadPool;
-use resp::{RedisCommand, RedisValue};
+use storage::Storage;
 
 #[allow(unused_macros)]
 macro_rules! syscall {
@@ -141,7 +141,7 @@ fn get_kqueue_events(kq: i32) -> std::io::Result<Vec<libc::kevent>> {
             data: 0,
             udata: std::ptr::null_mut(),
         };
-        256
+        512
     ];
     let n = syscall!(kevent(
         kq,
@@ -155,19 +155,42 @@ fn get_kqueue_events(kq: i32) -> std::io::Result<Vec<libc::kevent>> {
     Ok(events)
 }
 
-fn handle_request(request: Vec<u8>) -> Vec<u8> {
+fn handle_request(request: Vec<u8>, storage: &mut Storage) -> Vec<u8> {
     let extracted_command = match resp::extract_commands(&request) {
-      Ok(cmd) => cmd,
-      Err(e) => {
-        eprintln!("Failed to parse request: {}", e);
-        return b"-ERR failed to parse request\r\n".to_vec();
-      }
+        Ok(cmd) => cmd,
+        Err(e) => {
+            eprintln!("Failed to parse request: {}", e);
+            return b"-ERR failed to parse request\r\n".to_vec();
+        }
     };
+    const OK_RESPONSE: &[u8] = "+OK\r\n".as_bytes();
+    const NULL_BULK_STRING: &[u8] = "$-1\r\n".as_bytes();
     match extracted_command {
-      RedisCommand::PING(message) | RedisCommand::ECHO(message) => {
-        message.to_resp_string().as_bytes().to_vec()
-      }
-      _ => b"-ERR unknown command\r\n".to_vec(),
+        RedisCommand::PING(message) | RedisCommand::ECHO(message) => {
+            message.to_resp_string().as_bytes().to_vec()
+        }
+        RedisCommand::COMMAND => OK_RESPONSE.to_vec(),
+        RedisCommand::CONFIG => OK_RESPONSE.to_vec(),
+        RedisCommand::GET(key) => match key {
+            RedisValue::BulkString(Some(k)) | RedisValue::SimpleString(k) => match storage.get(k) {
+                Some(data) => data.value().to_resp_string().as_bytes().to_vec(),
+                None => NULL_BULK_STRING.to_vec(),
+            },
+            _ => RedisValue::Error("ERR invalid".to_string())
+                .to_resp_string()
+                .as_bytes()
+                .to_vec(),
+        },
+        RedisCommand::SET(key, value, expiry) => match key {
+            RedisValue::BulkString(Some(k)) | RedisValue::SimpleString(k) => {
+                storage.set(k, value, expiry);
+                OK_RESPONSE.to_vec()
+            }
+            _ => RedisValue::Error("ERR invalid".to_string())
+                .to_resp_string()
+                .as_bytes()
+                .to_vec(),
+        },
     }
 }
 
@@ -186,7 +209,7 @@ fn main() {
         KqueueRegistrationAction::Register,
     )
     .expect("Failed to register listener with kqueue");
-    let pool = ThreadPool::new(4); // TODO: make use of this
+    let mut storage = Storage::new();
     loop {
         println!("Waiting for events");
         println!("Requests in flight {}", streams_map.len());
@@ -222,7 +245,7 @@ fn main() {
                         match event.filter {
                             libc::EVFILT_READ => match request_context.handle_read() {
                                 Ok(Some(request)) => {
-                                    let response = handle_request(request);
+                                    let response = handle_request(request, &mut storage);
                                     request_context.dispatch_write(&response);
                                     update_kqueue(
                                         kq,

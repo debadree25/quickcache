@@ -490,4 +490,16 @@ mod tests {
     fn test_extract_commands_echo() {
         test_extract_commands(b"*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n", RedisCommand::ECHO(RedisValue::BulkString(Some("hello".to_string()))));
     }
+
+    #[test]
+    fn test_extract_commands_get() {
+        test_extract_commands(b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n", RedisCommand::GET(RedisValue::BulkString(Some("key".to_string()))));
+    }
+
+    #[test]
+    fn test_extract_commands_set() {
+        test_extract_commands(b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n", RedisCommand::SET(RedisValue::BulkString(Some("key".to_string())), RedisValue::BulkString(Some("value".to_string())), None));
+        test_extract_commands(b"*5\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n$2\r\nEX\r\n$1\r\n5\r\n", RedisCommand::SET(RedisValue::BulkString(Some("key".to_string())), RedisValue::BulkString(Some("value".to_string())), Some(5000)));
+        test_extract_commands(b"*5\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n$2\r\nPX\r\n$3\r\n100\r\n", RedisCommand::SET(RedisValue::BulkString(Some("key".to_string())), RedisValue::BulkString(Some("value".to_string())), Some(100)));
+    }
 }
